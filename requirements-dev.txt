@@ -1,0 +1,5 @@
+# Development/CI tooling (linters and type checker)
+ruff
+flake8
+mypy
+types-requests
