@@ -23,7 +23,7 @@ import urllib3
 if sys.version_info < (3, 10):  # noqa: UP036
     sys.exit("f5_ssl_scan.py requires Python 3.10 or newer")
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # Security-support end-of-life dates for CPython releases (source: python.org).
 # Python exposes no stdlib API for this, so it is maintained here.
