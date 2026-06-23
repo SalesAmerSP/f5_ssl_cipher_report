@@ -1,5 +1,5 @@
 # Runtime dependencies for f5_ssl_scan.py
 # requests is the HTTP client; urllib3 is imported directly to manage the
 # InsecureRequestWarning. Floors pick up known security fixes.
-requests>=2.32.0
+requests>=2.34.2
 urllib3>=2.0.0
