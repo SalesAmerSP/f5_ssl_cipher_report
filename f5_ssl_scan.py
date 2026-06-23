@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
 import getpass
 import json
 import os
@@ -23,6 +24,19 @@ if sys.version_info < (3, 10):  # noqa: UP036
     sys.exit("f5_ssl_scan.py requires Python 3.10 or newer")
 
 __version__ = "1.1.0"
+
+# Security-support end-of-life dates for CPython releases (source: python.org).
+# Python exposes no stdlib API for this, so it is maintained here.
+PYTHON_EOL = {
+    (3, 9): "2025-10-31",
+    (3, 10): "2026-10-31",
+    (3, 11): "2027-10-31",
+    (3, 12): "2028-10-31",
+    (3, 13): "2029-10-31",
+    (3, 14): "2030-10-31",
+}
+# EOL date of the interpreter currently running this script (None if unknown).
+PYTHON_EOL_DATE = PYTHON_EOL.get((sys.version_info.major, sys.version_info.minor))
 
 
 @dataclass
@@ -239,8 +253,17 @@ def create_ssl_csv(csvfile: str, CLIENT_CIPHER_DICT: dict[str, dict[str, str]],
                                     current_server_profile, current_server_parent_profile])
 
 
+def warn_if_python_eol() -> None:
+    """Warn on stderr if the running interpreter's security support has ended."""
+    if PYTHON_EOL_DATE is not None and datetime.date.today() > datetime.date.fromisoformat(PYTHON_EOL_DATE):
+        print('WARNING: Python ' + str(sys.version_info.major) + '.' + str(sys.version_info.minor)
+              + ' reached end-of-life on ' + PYTHON_EOL_DATE + ' and no longer receives security '
+              'updates; upgrade to a supported release.', file=sys.stderr)
+
+
 def main() -> None:
     """Entry point: gather profiles and virtuals, then print the report and optional CSV."""
+    warn_if_python_eol()
     cfg = get_args()
     bigip = BigIp(cfg.host, cfg.username, cfg.password, cfg.verify, cfg.timeout)
     client_ssl_profiles = retrieve_ssl_profiles(
