@@ -2,4 +2,4 @@
 # requests is the HTTP client; urllib3 is imported directly to manage the
 # InsecureRequestWarning. Floors pick up known security fixes.
 requests>=2.34.2
-urllib3>=2.0.0
+urllib3>=2.7.0
