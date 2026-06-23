@@ -11,9 +11,12 @@ import sys
 import requests
 import urllib3
 
+__version__ = "1.1.0"
+
 
 def get_args():
     cmdargs = argparse.ArgumentParser()
+    cmdargs.add_argument('--version', action='version', version='%(prog)s ' + __version__)
     cmdargs.add_argument('--host', action='store', required=False, type=str,
                          help='ip of BIG-IP REST interface, typically the mgmt ip (or F5_HOST env var)')
     cmdargs.add_argument('--username', action='store', required=False, type=str,
