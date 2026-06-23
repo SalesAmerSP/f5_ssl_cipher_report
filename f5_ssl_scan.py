@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+"""Report BIG-IP LTM virtual servers and their SSL profiles/ciphers via iControl REST."""
+
+from __future__ import annotations
 
 import argparse
 import csv
@@ -7,6 +10,7 @@ import json
 import os
 import shlex
 import sys
+from typing import Any, NoReturn
 
 import requests
 import urllib3
@@ -14,7 +18,8 @@ import urllib3
 __version__ = "1.1.0"
 
 
-def get_args():
+def get_args() -> dict[str, Any]:
+    """Parse CLI arguments, resolve credentials/TLS settings, and return a config dict."""
     cmdargs = argparse.ArgumentParser()
     cmdargs.add_argument('--version', action='version', version='%(prog)s ' + __version__)
     cmdargs.add_argument('--host', action='store', required=False, type=str,
@@ -53,7 +58,7 @@ def get_args():
     if not password:
         password = getpass.getpass('Password for ' + username + '@' + host + ': ')
     if parsed_args.insecure:
-        verify = False
+        verify: bool | str = False
     elif parsed_args.ca_bundle:
         verify = parsed_args.ca_bundle
     else:
@@ -64,7 +69,8 @@ def get_args():
     return BIG_IP
 
 
-def abort_script(reason):
+def abort_script(reason: object) -> NoReturn:
+    """Print an error and exit with status 2."""
     print('*** Aborting script execution! ***')
     if len(str(reason)) > 0:
         print('ERROR: ' + str(reason))
@@ -74,7 +80,8 @@ def abort_script(reason):
 class BigIp:
     """Thin iControl REST client: one authenticated, reused session per BIG-IP."""
 
-    def __init__(self, host, username, password, verify, timeout=30):
+    def __init__(self, host: str, username: str, password: str,
+                 verify: bool | str, timeout: float = 30) -> None:
         self.base_uri = 'https://' + host + '/mgmt/tm'
         self.verify = verify
         self.timeout = timeout
@@ -82,7 +89,8 @@ class BigIp:
         self.session.headers.update({'Content-type': 'application/json'})
         self.session.auth = (username, password)
 
-    def _request(self, method, path, **kwargs):
+    def _request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+        """Issue a request relative to the BIG-IP /mgmt/tm base; abort on any error."""
         try:
             response = self.session.request(method, self.base_uri + path, verify=self.verify,
                                             timeout=self.timeout, **kwargs)
@@ -91,21 +99,24 @@ class BigIp:
             abort_script(str(e))
         return response
 
-    def get_json(self, path):
+    def get_json(self, path: str) -> Any:
+        """GET a path and return the parsed JSON body."""
         return json.loads(self._request('GET', path).text)
 
-    def post_json(self, path, payload):
+    def post_json(self, path: str, payload: dict[str, Any]) -> Any:
+        """POST a JSON payload to a path and return the parsed JSON body."""
         return json.loads(self._request('POST', path, data=json.dumps(payload)).text)
 
 
-def retrieve_ssl_profiles(bigip, profile_type, label, tmm_flag, fullciphers, verbose):
+def retrieve_ssl_profiles(bigip: BigIp, profile_type: str, label: str, tmm_flag: str,
+                          fullciphers: bool, verbose: bool) -> dict[str, dict[str, str]]:
     """Return {name: {name, cipherstring, parent, [cipherlist]}} for an SSL profile type.
 
     profile_type is the REST collection ('client-ssl' / 'server-ssl'), label is the
     word used in output ('Client' / 'Server'), and tmm_flag is the tmm option used to
     expand the cipher list ('--clientciphers' / '--serverciphers').
     """
-    profiles = {}
+    profiles: dict[str, dict[str, str]] = {}
     for profile in bigip.get_json('/ltm/profile/' + profile_type).get('items', []):
         name = str(profile['name'])
         cipherstring = str(profile['ciphers'])
@@ -124,7 +135,8 @@ def retrieve_ssl_profiles(bigip, profile_type, label, tmm_flag, fullciphers, ver
     return profiles
 
 
-def fetch_virtual_profiles(bigip, virtual):
+def fetch_virtual_profiles(bigip: BigIp, virtual: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the profile list attached to a single virtual server."""
     if 'subPath' in virtual:
         path = ('/ltm/virtual/~' + virtual['partition'] + '~' + virtual['subPath']
                 + '~' + virtual['name'] + '/profiles')
@@ -133,7 +145,8 @@ def fetch_virtual_profiles(bigip, virtual):
     return bigip.get_json(path).get('items', [])
 
 
-def retrieve_virtual_servers(bigip, verbose):
+def retrieve_virtual_servers(bigip: BigIp, verbose: bool) -> list[dict[str, Any]]:
+    """Return all virtual servers, each annotated with its fetched 'profiles' list."""
     virtual_servers = bigip.get_json('/ltm/virtual').get('items', [])
     for current_virtual_server in virtual_servers:
         if verbose:
@@ -144,7 +157,9 @@ def retrieve_virtual_servers(bigip, verbose):
     return virtual_servers
 
 
-def print_ssl_profile(profile_name, context, cipher_dict, fullcipherflag):
+def print_ssl_profile(profile_name: str, context: str, cipher_dict: dict[str, dict[str, str]],
+                      fullcipherflag: bool) -> None:
+    """Print one SSL profile's cipher string, parent, and (optionally) full cipher list."""
     print(' -> Profile found: ' + profile_name + ' (Context: ' + context + ')')
     print('   -> Cipher string: ' + cipher_dict[profile_name]['cipherstring'])
     print('   -> Parent profile: ' + cipher_dict[profile_name]['parent'])
@@ -152,7 +167,10 @@ def print_ssl_profile(profile_name, context, cipher_dict, fullcipherflag):
         print('   -> Complete cipher list: \n' + cipher_dict[profile_name]['cipherlist'])
 
 
-def create_ssl_report(fullcipherflag, CLIENT_CIPHER_DICT, SERVER_CIPHER_DICT, LTM_VIRTUAL_LIST, verbose):
+def create_ssl_report(fullcipherflag: bool, CLIENT_CIPHER_DICT: dict[str, dict[str, str]],
+                      SERVER_CIPHER_DICT: dict[str, dict[str, str]],
+                      LTM_VIRTUAL_LIST: list[dict[str, Any]], verbose: bool) -> None:
+    """Print the per-virtual-server SSL profile report to stdout."""
     for current_virtual in LTM_VIRTUAL_LIST:
         print('*********************\nVirtual server: ' + current_virtual['fullPath']
               + ' (' + current_virtual['destination'] + ')')
@@ -167,7 +185,10 @@ def create_ssl_report(fullcipherflag, CLIENT_CIPHER_DICT, SERVER_CIPHER_DICT, LT
                 print('   -> Non-SSL Profile')
 
 
-def create_ssl_csv(csvfile, CLIENT_CIPHER_DICT, SERVER_CIPHER_DICT, LTM_VIRTUAL_LIST):
+def create_ssl_csv(csvfile: str, CLIENT_CIPHER_DICT: dict[str, dict[str, str]],
+                   SERVER_CIPHER_DICT: dict[str, dict[str, str]],
+                   LTM_VIRTUAL_LIST: list[dict[str, Any]]) -> None:
+    """Write a per-virtual-server summary (client/server profile + parent) to a CSV file."""
     try:
         outputcsv = open(csvfile, mode="w", newline='')
     except OSError as e:
@@ -196,7 +217,8 @@ def create_ssl_csv(csvfile, CLIENT_CIPHER_DICT, SERVER_CIPHER_DICT, LTM_VIRTUAL_
                                     current_server_profile, current_server_parent_profile])
 
 
-def main():
+def main() -> None:
+    """Entry point: gather profiles and virtuals, then print the report and optional CSV."""
     BIG_IP = get_args()
     if BIG_IP['verify'] is False:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
