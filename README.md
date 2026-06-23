@@ -101,3 +101,19 @@ Virtual Server Path,Virtual Server Destination,CLIENT SSL PROFILE,PARENT CLIENT 
 /Common/accounts_receivable_vs,/Common/10.1.10.70:80,none,none,none,none
 /Common/web_app_42,/Common/10.1.10.66:443,clientssl,none,none,none
 ```
+
+## Testing
+
+Unit-free linting/type-checking runs in CI (ruff, flake8, mypy on Python
+3.10–3.13). Because the script's real behavior depends on a live BIG-IP, there
+is also a **manual** smoke suite at [`scripts/smoke.sh`](scripts/smoke.sh) that
+exercises every flag, credential path, error abort, and output mode against a
+real device. It is not run in CI (it needs hardware). To run it:
+
+```
+export F5_HOST=<mgmt-ip> F5_USERNAME=admin F5_PASSWORD='<password>'
+bash scripts/smoke.sh
+```
+
+It assumes a reachable lab BIG-IP with a self-signed management certificate,
+checks each invocation's exit code and output, and prints a pass/fail summary.
