@@ -11,7 +11,9 @@ import json
 import os
 import re
 import shlex
+import ssl
 import sys
+import warnings
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
@@ -52,6 +54,7 @@ class Config:
     csv: str | None
     verify: bool | str
     timeout: float
+    min_tls: str | None
 
 
 def get_args() -> Config:
@@ -77,6 +80,13 @@ def get_args() -> Config:
                          help='disable TLS certificate verification of the BIG-IP management interface (not recommended)')
     cmdargs.add_argument('--timeout', action='store', required=False, type=float, default=30,
                          help='per-request timeout in seconds (default: 30)')
+    cmdargs.add_argument('--min-tls', action='store', required=False,
+                         choices=['1.0', '1.1', '1.2', '1.3'],
+                         help='minimum TLS version for connecting to the BIG-IP management '
+                              'interface. Lower it (e.g. 1.0) to reach legacy TMOS whose httpd '
+                              'predates TLS 1.2 (such as 13.1), which otherwise closes the '
+                              'connection mid-handshake. Values below 1.2 are insecure and '
+                              'intended only for old management interfaces.')
     parsed_args = cmdargs.parse_args()
     if parsed_args.password is not None:
         cmdargs.error('--password is not supported for security reasons: it exposes the '
@@ -99,9 +109,14 @@ def get_args() -> Config:
         verify = parsed_args.ca_bundle
     else:
         verify = True
+    if parsed_args.min_tls in ('1.0', '1.1'):
+        print('WARNING: --min-tls ' + parsed_args.min_tls + ' permits legacy TLS '
+              + parsed_args.min_tls + '; use only to reach old management interfaces.',
+              file=sys.stderr)
     return Config(host=host, username=username, password=password,
                   fullciphers=parsed_args.fullciphers, verbose=parsed_args.verbose,
-                  csv=parsed_args.csv, verify=verify, timeout=parsed_args.timeout)
+                  csv=parsed_args.csv, verify=verify, timeout=parsed_args.timeout,
+                  min_tls=parsed_args.min_tls)
 
 
 def abort_script(reason: object) -> NoReturn:
@@ -112,11 +127,58 @@ def abort_script(reason: object) -> NoReturn:
     sys.exit(2)
 
 
+def build_tls_context(min_tls: str, verify: bool | str) -> ssl.SSLContext:
+    """Build an SSLContext that allows a lower minimum TLS version than the default.
+
+    The cert-verification posture mirrors `verify` so it matches normal requests
+    behavior. For TLS < 1.2 the OpenSSL security level is dropped to 0 as well,
+    because modern OpenSSL otherwise rejects the legacy ciphers/short keys that
+    old TMOS management httpd presents.
+    """
+    ctx = ssl.create_default_context()
+    with warnings.catch_warnings():
+        # ssl.TLSVersion.TLSv1/TLSv1_1 are deprecated; the user has explicitly
+        # opted into legacy TLS and is already warned, so silence the redundant noise.
+        warnings.simplefilter('ignore', DeprecationWarning)
+        ctx.minimum_version = {
+            '1.0': ssl.TLSVersion.TLSv1,
+            '1.1': ssl.TLSVersion.TLSv1_1,
+            '1.2': ssl.TLSVersion.TLSv1_2,
+            '1.3': ssl.TLSVersion.TLSv1_3,
+        }[min_tls]
+    if min_tls in ('1.0', '1.1'):
+        ctx.set_ciphers('DEFAULT@SECLEVEL=0')
+    if verify is False:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    elif isinstance(verify, str):
+        ctx.load_verify_locations(verify)
+    return ctx
+
+
+class _TLSAdapter(requests.adapters.HTTPAdapter):
+    """HTTPAdapter that pins a custom ssl.SSLContext (used for --min-tls)."""
+
+    def __init__(self, ssl_context: ssl.SSLContext, **kwargs: Any) -> None:
+        self._ssl_context = ssl_context
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
+        kwargs['ssl_context'] = self._ssl_context
+        super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, *args: Any, **kwargs: Any) -> Any:
+        kwargs['ssl_context'] = self._ssl_context
+        return super().proxy_manager_for(*args, **kwargs)
+
+
 class BigIp:
     """Thin iControl REST client: one authenticated, reused session per BIG-IP."""
 
     def __init__(self, host: str, username: str, password: str,
-                 verify: bool | str, timeout: float = 30) -> None:
+                 verify: bool | str, timeout: float = 30,
+                 min_tls: str | None = None) -> None:
+        self.host = host
         self.base_uri = 'https://' + host + '/mgmt/tm'
         self.verify = verify
         self.timeout = timeout
@@ -125,6 +187,8 @@ class BigIp:
         self.session = requests.session()
         self.session.headers.update({'Content-type': 'application/json'})
         self.session.auth = (username, password)
+        if min_tls is not None:
+            self.session.mount('https://', _TLSAdapter(build_tls_context(min_tls, verify)))
 
     def _request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
         """Issue a request relative to the BIG-IP /mgmt/tm base; abort on any error."""
@@ -132,6 +196,13 @@ class BigIp:
             response = self.session.request(method, self.base_uri + path, verify=self.verify,
                                             timeout=self.timeout, **kwargs)
             response.raise_for_status()
+        except requests.exceptions.SSLError as e:
+            abort_script(str(e) + '\nThe TLS handshake to the management interface failed. '
+                         'This usually means either (1) this address is a data-plane virtual '
+                         'server, not the management interface -- re-target the BIG-IP management '
+                         'IP; or (2) a legacy device (e.g. TMOS 13.x) whose httpd predates TLS 1.2 '
+                         '-- retry with --min-tls 1.0. Diagnose with: '
+                         'openssl s_client -connect ' + self.host + ':443')
         except requests.exceptions.RequestException as e:
             abort_script(str(e))
         return response
@@ -316,7 +387,7 @@ def main() -> None:
     """Entry point: gather profiles and virtuals, then print the report and optional CSV."""
     warn_if_python_eol()
     cfg = get_args()
-    bigip = BigIp(cfg.host, cfg.username, cfg.password, cfg.verify, cfg.timeout)
+    bigip = BigIp(cfg.host, cfg.username, cfg.password, cfg.verify, cfg.timeout, cfg.min_tls)
     client_ssl_profiles = retrieve_ssl_profiles(
         bigip, 'client-ssl', 'Client', '--clientciphers', cfg.fullciphers, cfg.verbose)
     server_ssl_profiles = retrieve_ssl_profiles(

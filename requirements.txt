@@ -1,5 +1,7 @@
 # Runtime dependencies for f5_ssl_scan.py
 # requests is the HTTP client; urllib3 is imported directly to manage the
-# InsecureRequestWarning. Floors pick up known security fixes.
+# InsecureRequestWarning. The --min-tls option builds on requests' own
+# HTTPAdapter and the stdlib `ssl` module, so it adds no new dependency.
+# Floors pick up known security fixes.
 requests>=2.34.2
 urllib3>=2.7.0

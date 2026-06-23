@@ -46,6 +46,7 @@ python3 f5_ssl_scan.py --fullciphers
 | `--fullciphers` | no | Expand and print the complete negotiated cipher list for each SSL profile (requires bash privileges; see above) |
 | `--ca-bundle` | no | Path to a CA bundle used to verify the BIG-IP management certificate |
 | `--insecure` | no | Disable TLS certificate verification of the management interface (not recommended) |
+| `--min-tls` | no | Minimum TLS version (`1.0`/`1.1`/`1.2`/`1.3`) for connecting to the management interface; lower it for legacy TMOS such as 13.x (see Troubleshooting). Values below 1.2 are insecure. |
 | `--timeout` | no | Per-request timeout in seconds (default: 30) |
 | `--verbose` | no | Print additional detail during execution (each profile/virtual found, non-SSL profiles) |
 
@@ -62,6 +63,35 @@ suppresses the urllib3 insecure-request warning).
 
 On an authentication failure (HTTP 401) or other HTTP error, the script aborts
 with a clear message rather than a stack trace, and exits with status `2`.
+
+### Troubleshooting: TLS handshake fails / `UNEXPECTED_EOF_WHILE_READING`
+
+If the script aborts with an SSL error such as
+`SSLError(... UNEXPECTED_EOF_WHILE_READING ...)` or `UNSUPPORTED_PROTOCOL`, the
+TLS handshake to the device failed before any HTTP happened — so `--insecure`
+(which only skips certificate *verification*) will **not** help. The two common
+causes are:
+
+1. **Wrong target — a data-plane VIP, not the management interface.** iControl
+   REST lives on the BIG-IP **management** address (or a self-IP whose
+   port-lockdown allows TMUI/443). Point `--host` at the management IP and check
+   the certificate: `openssl s_client -connect <host>:443` — a real mgmt
+   interface presents the device's self-signed cert (often
+   `CN = localhost.localdomain`), whereas a VIP presents an application cert.
+
+2. **A legacy device that predates TLS 1.2.** Older TMOS management httpd (e.g.
+   **13.1**) defaults to TLS 1.0, which a modern OpenSSL client refuses by
+   default (its ClientHello floors at TLS 1.2), and the device closes the
+   socket. Retry with `--min-tls 1.0`:
+
+   ```
+   python3 f5_ssl_scan.py --host <mgmt-ip> --insecure --min-tls 1.0
+   ```
+
+   `--min-tls` below 1.2 also drops the OpenSSL security level so the legacy
+   ciphers those devices present are accepted. It is a security downgrade —
+   use it only to reach old management interfaces, and prefer upgrading the
+   device's `sys httpd ssl-protocol` instead.
 
 ## Console output
 

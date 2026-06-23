@@ -26,8 +26,10 @@ run() { # run "<desc>" <want_exit> "<grep|->" -- cmd...
 }
 
 echo "## args / credentials (no network) ##"
-run "--version"             0 "1\.1\.0"              -- python3 "$S" --version
+run "--version"             0 "1\.2\.0"              -- python3 "$S" --version
 run "--help lists flags"    0 "--fullciphers"        -- python3 "$S" --help
+run "--help lists min-tls"  0 "--min-tls"            -- python3 "$S" --help
+run "bad min-tls rejected"  2 "invalid choice"       -- python3 "$S" --insecure --min-tls 1.5
 run "--password rejected"   2 "not supported"        -- python3 "$S" --password x
 run "missing host"          2 "host is required"     -- env -u F5_HOST python3 "$S" --insecure
 run "missing username"      2 "username is required" -- env -u F5_USERNAME python3 "$S" --insecure
@@ -42,6 +44,7 @@ echo "## success / output ##"
 run "normal run"            0 "report complete"      -- python3 "$S" --insecure
 run "verbose"               0 "found .* ssl profile" -- python3 "$S" --insecure --verbose
 run "fullciphers"           0 "suite|complete cipher list" -- python3 "$S" --insecure --fullciphers
+run "min-tls 1.2"           0 "report complete"      -- python3 "$S" --insecure --min-tls 1.2
 run "csv output"            0 "report complete"      -- python3 "$S" --insecure --csv /tmp/suite.csv
 if [ -s /tmp/suite.csv ] && head -1 /tmp/suite.csv | grep -q "Virtual Server Path"; then
   echo "PASS csv header written"; pass=$((pass + 1))
