@@ -10,16 +10,37 @@ import json
 import os
 import shlex
 import sys
+from dataclasses import dataclass
 from typing import Any, NoReturn
 
 import requests
 import urllib3
 
+# Runtime guard for bare `python f5_ssl_scan.py` runs that bypass pip (which
+# already enforces >=3.10 via the dependencies). UP036 is suppressed because the
+# check is intentional, not dead code.
+if sys.version_info < (3, 10):  # noqa: UP036
+    sys.exit("f5_ssl_scan.py requires Python 3.10 or newer")
+
 __version__ = "1.1.0"
 
 
-def get_args() -> dict[str, Any]:
-    """Parse CLI arguments, resolve credentials/TLS settings, and return a config dict."""
+@dataclass
+class Config:
+    """Resolved runtime configuration produced by get_args()."""
+
+    host: str
+    username: str
+    password: str
+    fullciphers: bool
+    verbose: bool
+    csv: str | None
+    verify: bool | str
+    timeout: float
+
+
+def get_args() -> Config:
+    """Parse CLI arguments, resolve credentials/TLS settings, and return a Config."""
     cmdargs = argparse.ArgumentParser()
     cmdargs.add_argument('--version', action='version', version='%(prog)s ' + __version__)
     cmdargs.add_argument('--host', action='store', required=False, type=str,
@@ -63,10 +84,9 @@ def get_args() -> dict[str, Any]:
         verify = parsed_args.ca_bundle
     else:
         verify = True
-    BIG_IP = {'host': host, 'username': username, 'password': password,
-              'fullciphers': parsed_args.fullciphers, 'verbose': parsed_args.verbose, 'csv': parsed_args.csv,
-              'verify': verify, 'timeout': parsed_args.timeout}
-    return BIG_IP
+    return Config(host=host, username=username, password=password,
+                  fullciphers=parsed_args.fullciphers, verbose=parsed_args.verbose,
+                  csv=parsed_args.csv, verify=verify, timeout=parsed_args.timeout)
 
 
 def abort_script(reason: object) -> NoReturn:
@@ -85,6 +105,8 @@ class BigIp:
         self.base_uri = 'https://' + host + '/mgmt/tm'
         self.verify = verify
         self.timeout = timeout
+        if verify is False:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         self.session = requests.session()
         self.session.headers.update({'Content-type': 'application/json'})
         self.session.auth = (username, password)
@@ -219,19 +241,17 @@ def create_ssl_csv(csvfile: str, CLIENT_CIPHER_DICT: dict[str, dict[str, str]],
 
 def main() -> None:
     """Entry point: gather profiles and virtuals, then print the report and optional CSV."""
-    BIG_IP = get_args()
-    if BIG_IP['verify'] is False:
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    bigip = BigIp(BIG_IP['host'], BIG_IP['username'], BIG_IP['password'], BIG_IP['verify'], BIG_IP['timeout'])
-    client_ssl_profile_list = retrieve_ssl_profiles(bigip, 'client-ssl', 'Client', '--clientciphers',
-                                                    BIG_IP['fullciphers'], BIG_IP['verbose'])
-    server_ssl_profile_list = retrieve_ssl_profiles(bigip, 'server-ssl', 'Server', '--serverciphers',
-                                                    BIG_IP['fullciphers'], BIG_IP['verbose'])
-    virtual_server_list = retrieve_virtual_servers(bigip, BIG_IP['verbose'])
-    create_ssl_report(BIG_IP['fullciphers'], client_ssl_profile_list, server_ssl_profile_list,
-                      virtual_server_list, BIG_IP['verbose'])
-    if BIG_IP['csv']:
-        create_ssl_csv(BIG_IP['csv'], client_ssl_profile_list, server_ssl_profile_list, virtual_server_list)
+    cfg = get_args()
+    bigip = BigIp(cfg.host, cfg.username, cfg.password, cfg.verify, cfg.timeout)
+    client_ssl_profiles = retrieve_ssl_profiles(
+        bigip, 'client-ssl', 'Client', '--clientciphers', cfg.fullciphers, cfg.verbose)
+    server_ssl_profiles = retrieve_ssl_profiles(
+        bigip, 'server-ssl', 'Server', '--serverciphers', cfg.fullciphers, cfg.verbose)
+    virtual_server_list = retrieve_virtual_servers(bigip, cfg.verbose)
+    create_ssl_report(cfg.fullciphers, client_ssl_profiles, server_ssl_profiles,
+                      virtual_server_list, cfg.verbose)
+    if cfg.csv:
+        create_ssl_csv(cfg.csv, client_ssl_profiles, server_ssl_profiles, virtual_server_list)
     print('\nReport complete.')
 
 
