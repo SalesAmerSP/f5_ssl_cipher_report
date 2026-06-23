@@ -6,21 +6,49 @@ import urllib3
 import argparse
 import sys
 import csv
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import getpass
+import os
+import shlex
 
 def get_args():
     cmdargs = argparse.ArgumentParser()
-    cmdargs.add_argument('--host', action='store', required=True, type=str,
-                         help='ip of BIG-IP REST interface, typically the mgmt ip')
-    cmdargs.add_argument('--username', action='store', required=True, type=str, help='username for REST authentication')
-    cmdargs.add_argument('--password', action='store', required=True, type=str, help='password for REST authentication')
+    cmdargs.add_argument('--host', action='store', required=False, type=str,
+                         help='ip of BIG-IP REST interface, typically the mgmt ip (or F5_HOST env var)')
+    cmdargs.add_argument('--username', action='store', required=False, type=str, help='username for REST authentication (or F5_USERNAME env var)')
+    # Accepted but intentionally unsupported: catch it so we can return a helpful
+    # message instead of argparse's generic "unrecognized arguments" error.
+    cmdargs.add_argument('--password', nargs='?', const=True, default=None, help=argparse.SUPPRESS)
     cmdargs.add_argument('--csv', action='store', required=False, type=str, help='CSV filename for report (optional)')
     cmdargs.add_argument('--fullciphers', action='store_true', required=False, help='flag for displaying list of all ciphers in profile')
     cmdargs.add_argument('--verbose', action='store_true', required=False, help='prints additional information during execution')
+    cmdargs.add_argument('--ca-bundle', action='store', required=False, type=str, help='path to a CA bundle used to verify the BIG-IP management certificate')
+    cmdargs.add_argument('--insecure', action='store_true', required=False, help='disable TLS certificate verification of the BIG-IP management interface (not recommended)')
+    cmdargs.add_argument('--timeout', action='store', required=False, type=float, default=30, help='per-request timeout in seconds (default: 30)')
     parsed_args = cmdargs.parse_args()
-    BIG_IP = {'host': parsed_args.host, 'username': parsed_args.username, 'password': parsed_args.password,
-              'fullciphers': parsed_args.fullciphers, 'verbose': parsed_args.verbose, 'csv': parsed_args.csv}
+    if parsed_args.password is not None:
+        cmdargs.error('--password is not supported for security reasons: it exposes the '
+                      'credential in your shell history and the process list. Use the F5_PASSWORD '
+                      'environment variable instead, or omit it to be prompted securely. Since you '
+                      'just typed it, scrub it from your shell history now '
+                      "(e.g. 'history -d <line>' for bash, or 'history delete <n>' for zsh).")
+    host = parsed_args.host or os.environ.get('F5_HOST')
+    if not host:
+        cmdargs.error('host is required: pass --host or set the F5_HOST environment variable')
+    username = parsed_args.username or os.environ.get('F5_USERNAME')
+    if not username:
+        cmdargs.error('username is required: pass --username or set the F5_USERNAME environment variable')
+    password = os.environ.get('F5_PASSWORD')
+    if not password:
+        password = getpass.getpass('Password for ' + username + '@' + host + ': ')
+    if parsed_args.insecure:
+        verify = False
+    elif parsed_args.ca_bundle:
+        verify = parsed_args.ca_bundle
+    else:
+        verify = True
+    BIG_IP = {'host': host, 'username': username, 'password': password,
+              'fullciphers': parsed_args.fullciphers, 'verbose': parsed_args.verbose, 'csv': parsed_args.csv,
+              'verify': verify, 'timeout': parsed_args.timeout}
     return BIG_IP
 
 def abort_script(reason):
@@ -29,113 +57,99 @@ def abort_script(reason):
         print('ERROR: ' + str(reason))
     sys.exit(2)
 
-def icontrol_get(host, username, password, path):
-    apiCall = requests.session()
-    apiCall.headers.update({'Content-type': 'application/json'})
-    apiCall.auth = (username, password)
-    apiUri = 'https://' + host + '/mgmt/tm' + path
-    try:
-        apiResponse = apiCall.get(apiUri, verify=False)
-    except requests.exceptions.RequestException as e:
-        abort_script(str(e))
-        return
-    return apiResponse.text
+class BigIp:
+    """Thin iControl REST client: one authenticated, reused session per BIG-IP."""
 
-def retrieve_clientssl_profiles(host, username, password, fullciphers, verbose):
-    api_response = icontrol_get(host, username, password, '/ltm/profile/client-ssl')
-    api_response_dict = json.loads(api_response)
-    clientssl_profile_list = api_response_dict['items']
-    CLIENTSSL_PROFILE_CIPHERS = {}
-    for current_clientssl_profile in clientssl_profile_list:
-        current_clientssl_profile_name = str(current_clientssl_profile['name'])
-        current_clientssl_profile_cipherstring = str(current_clientssl_profile['ciphers'])
-        if 'defaultsFrom' in current_clientssl_profile.keys():
-            current_clientssl_profile_parent = str(current_clientssl_profile['defaultsFrom'])
-        else:
-            current_clientssl_profile_parent = 'none'
+    def __init__(self, host, username, password, verify, timeout=30):
+        self.base_uri = 'https://' + host + '/mgmt/tm'
+        self.verify = verify
+        self.timeout = timeout
+        self.session = requests.session()
+        self.session.headers.update({'Content-type': 'application/json'})
+        self.session.auth = (username, password)
+
+    def _request(self, method, path, **kwargs):
+        try:
+            response = self.session.request(method, self.base_uri + path, verify=self.verify, timeout=self.timeout, **kwargs)
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            abort_script(str(e))
+        return response
+
+    def get_json(self, path):
+        return json.loads(self._request('GET', path).text)
+
+    def post_json(self, path, payload):
+        return json.loads(self._request('POST', path, data=json.dumps(payload)).text)
+
+def retrieve_ssl_profiles(bigip, profile_type, label, tmm_flag, fullciphers, verbose):
+    """Return {name: {name, cipherstring, parent, [cipherlist]}} for an SSL profile type.
+
+    profile_type is the REST collection ('client-ssl' / 'server-ssl'), label is the
+    word used in output ('Client' / 'Server'), and tmm_flag is the tmm option used to
+    expand the cipher list ('--clientciphers' / '--serverciphers').
+    """
+    profiles = {}
+    for profile in bigip.get_json('/ltm/profile/' + profile_type).get('items', []):
+        name = str(profile['name'])
+        cipherstring = str(profile['ciphers'])
+        parent = str(profile['defaultsFrom']) if 'defaultsFrom' in profile else 'none'
         if verbose:
-            print('Found Client SSL profile: ' + current_clientssl_profile_name)
-            print(' -> Ciphers: ' + current_clientssl_profile_cipherstring)
-        CLIENTSSL_PROFILE_CIPHERS[current_clientssl_profile_name] = {}
-        CLIENTSSL_PROFILE_CIPHERS[current_clientssl_profile_name]['name'] = current_clientssl_profile_name
-        CLIENTSSL_PROFILE_CIPHERS[current_clientssl_profile_name]['cipherstring'] = current_clientssl_profile_cipherstring
-        CLIENTSSL_PROFILE_CIPHERS[current_clientssl_profile_name]['parent'] = current_clientssl_profile_parent
+            print('Found ' + label + ' SSL profile: ' + name)
+            print(' -> Ciphers: ' + cipherstring)
+        entry = {'name': name, 'cipherstring': cipherstring, 'parent': parent}
         if fullciphers:
             if verbose:
-                print(' -> Retreiving complete cipher list')
-            api_payload = {"command": "run", "utilCmdArgs": "-c 'tmm --serverciphers " + current_clientssl_profile_cipherstring + "'"}
-            api_response = icontrol_post(host, username, password, '/util/bash', api_payload)
-            api_response_dict = json.loads(api_response)
-            current_clientssl_profile_cipherlist = api_response_dict['commandResult']
-            CLIENTSSL_PROFILE_CIPHERS[current_clientssl_profile_name]['cipherlist'] = current_clientssl_profile_cipherlist
-    return CLIENTSSL_PROFILE_CIPHERS
+                print(' -> Retrieving complete cipher list')
+            api_payload = {"command": "run", "utilCmdArgs": "-c " + shlex.quote("tmm " + tmm_flag + " " + cipherstring)}
+            entry['cipherlist'] = bigip.post_json('/util/bash', api_payload)['commandResult']
+        profiles[name] = entry
+    return profiles
 
-def retrieve_serverssl_profiles(host, username, password, fullciphers, verbose):
-    api_response = icontrol_get(host, username, password, '/ltm/profile/server-ssl')
-    api_response_dict = json.loads(api_response)
-    serverssl_profile_list = api_response_dict['items']
-    SERVERSSL_PROFILE_CIPHERS = {}
-    for current_serverssl_profile in serverssl_profile_list:
-        current_serverssl_profile_name = str(current_serverssl_profile['name'])
-        current_serverssl_profile_cipherstring = str(current_serverssl_profile['ciphers'])
-        if 'defaultsFrom' in current_serverssl_profile.keys():
-            current_serverssl_profile_parent = str(current_serverssl_profile['defaultsFrom'])
-        else:
-            current_serverssl_profile_parent = 'none'
+def fetch_virtual_profiles(bigip, virtual):
+    if 'subPath' in virtual:
+        path = '/ltm/virtual/~' + virtual['partition'] + '~' + virtual['subPath'] + '~' + virtual['name'] + '/profiles'
+    else:
+        path = '/ltm/virtual/~' + virtual['partition'] + '~' + virtual['name'] + '/profiles'
+    return bigip.get_json(path).get('items', [])
+
+def retrieve_virtual_servers(bigip, verbose):
+    virtual_servers = bigip.get_json('/ltm/virtual').get('items', [])
+    for current_virtual_server in virtual_servers:
         if verbose:
-            print('Found Server SSL profile: ' + current_serverssl_profile_name)
-            print(' -> Ciphers: ' + current_serverssl_profile_cipherstring)
-        SERVERSSL_PROFILE_CIPHERS[current_serverssl_profile_name] = {}
-        SERVERSSL_PROFILE_CIPHERS[current_serverssl_profile_name]['name'] = current_serverssl_profile_name
-        SERVERSSL_PROFILE_CIPHERS[current_serverssl_profile_name]['cipherstring'] = current_serverssl_profile_cipherstring
-        SERVERSSL_PROFILE_CIPHERS[current_serverssl_profile_name]['parent'] = current_serverssl_profile_parent
-        if fullciphers:
-            if verbose:
-                print(' -> Retreiving complete cipher list')
-            api_payload = {"command": "run", "utilCmdArgs": "-c 'tmm --serverciphers " + current_serverssl_profile_cipherstring + "'"}
-            api_response = icontrol_post(host, username, password, '/util/bash', api_payload)
-            api_response_dict = json.loads(api_response)
-            current_serverssl_profile_cipherlist = api_response_dict['commandResult']
-            SERVERSSL_PROFILE_CIPHERS[current_serverssl_profile_name]['cipherlist'] = current_serverssl_profile_cipherlist
-    return SERVERSSL_PROFILE_CIPHERS
-
-def retrieve_virtual_servers(host, username, password, verbose):
-    api_response = icontrol_get(host, username, password, '/ltm/virtual')
-    api_response_dict = json.loads(api_response)
-    LTM_VIRTUAL_LIST = api_response_dict['items']
-    if verbose:
-        for current_virtual_server in LTM_VIRTUAL_LIST:
             print("Found virtual server " + current_virtual_server['name'])
-    return LTM_VIRTUAL_LIST
+        # Fetch each virtual's profiles once here so the console and CSV reports
+        # can both read them without a second round of REST calls.
+        current_virtual_server['profiles'] = fetch_virtual_profiles(bigip, current_virtual_server)
+    return virtual_servers
 
-def create_ssl_report(host, username, password, fullcipherflag, CLIENT_CIPHER_DICT, SERVER_CIPHER_DICT, LTM_VIRTUAL_LIST, verbose):
+def print_ssl_profile(profile_name, context, cipher_dict, fullcipherflag):
+    print(' -> Profile found: ' + profile_name + ' (Context: ' + context + ')')
+    print('   -> Cipher string: ' + cipher_dict[profile_name]['cipherstring'])
+    print('   -> Parent profile: ' + cipher_dict[profile_name]['parent'])
+    if fullcipherflag:
+        print('   -> Complete cipher list: \n' + cipher_dict[profile_name]['cipherlist'])
+
+def create_ssl_report(fullcipherflag, CLIENT_CIPHER_DICT, SERVER_CIPHER_DICT, LTM_VIRTUAL_LIST, verbose):
     for current_virtual in LTM_VIRTUAL_LIST:
         print('*********************\nVirtual server: ' + current_virtual['fullPath'] + ' (' + current_virtual['destination'] + ')')
-        if 'subPath' in current_virtual.keys():
-            api_response = icontrol_get(host, username, password, '/ltm/virtual/~' + current_virtual['partition'] + '~' + current_virtual['subPath'] + '~' + current_virtual['name'] + '/profiles')
-        else:
-            api_response = icontrol_get(host, username, password, '/ltm/virtual/~' + current_virtual['partition'] + '~' + current_virtual['name'] + '/profiles')
-        api_response_dict = json.loads(api_response)
-        current_virtual_profiles = api_response_dict['items']
-        for current_virtual_profile in current_virtual_profiles:
-            if current_virtual_profile['context'] == 'clientside' and current_virtual_profile['name'] in CLIENT_CIPHER_DICT:
-                print(' -> Profile found: ' + current_virtual_profile['name'] + ' (Context: ' + current_virtual_profile['context'] + ')')
-                print('   -> Cipher string: ' + CLIENT_CIPHER_DICT[current_virtual_profile['name']]['cipherstring'])
-                print('   -> Parent profile: ' + CLIENT_CIPHER_DICT[current_virtual_profile['name']]['parent'])
-                if fullcipherflag:
-                    print('   -> Complete cipher list: \n' + CLIENT_CIPHER_DICT[current_virtual_profile['name']]['cipherlist'])
-            elif current_virtual_profile['context'] == 'serverside' and current_virtual_profile['name'] in SERVER_CIPHER_DICT:
-                print(' -> Profile found: ' + current_virtual_profile['name'] + ' (Context: ' + current_virtual_profile['context'] + ')')
-                print('   -> Cipher string: ' + SERVER_CIPHER_DICT[current_virtual_profile['name']]['cipherstring'])
-                print('   -> Parent profile: ' + SERVER_CIPHER_DICT[current_virtual_profile['name']]['parent'])
-                if fullcipherflag:
-                    print('   -> Complete cipher list: \n' + SERVER_CIPHER_DICT[current_virtual_profile['name']]['cipherlist'])
-            else:
-                if verbose:
-                    print('   -> Non-SSL Profile')
+        for current_virtual_profile in current_virtual['profiles']:
+            name = current_virtual_profile['name']
+            context = current_virtual_profile['context']
+            if context == 'clientside' and name in CLIENT_CIPHER_DICT:
+                print_ssl_profile(name, context, CLIENT_CIPHER_DICT, fullcipherflag)
+            elif context == 'serverside' and name in SERVER_CIPHER_DICT:
+                print_ssl_profile(name, context, SERVER_CIPHER_DICT, fullcipherflag)
+            elif verbose:
+                print('   -> Non-SSL Profile')
 
-def create_ssl_csv(host, username, password, csvfile, CLIENT_CIPHER_DICT, SERVER_CIPHER_DICT, LTM_VIRTUAL_LIST):
-    with open(csvfile, mode="w", newline='') as outputcsv:
+def create_ssl_csv(csvfile, CLIENT_CIPHER_DICT, SERVER_CIPHER_DICT, LTM_VIRTUAL_LIST):
+    try:
+        outputcsv = open(csvfile, mode="w", newline='')
+    except OSError as e:
+        abort_script(str(e))
+        return
+    with outputcsv:
         report_writer = csv.writer(outputcsv, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
         report_writer.writerow(['Virtual Server Path','Virtual Server Destination', 'CLIENT SSL PROFILE','PARENT CLIENT SSL PROFILE', 'SERVER SSL PROFILE','PARENT SERVER SSL PROFILE'])
         for current_virtual in LTM_VIRTUAL_LIST:
@@ -143,27 +157,28 @@ def create_ssl_csv(host, username, password, csvfile, CLIENT_CIPHER_DICT, SERVER
             current_client_parent_profile = 'none'
             current_server_profile = 'none'
             current_server_parent_profile = 'none'
-            if 'subPath' in current_virtual.keys():
-                api_response = icontrol_get(host, username, password, '/ltm/virtual/~' + current_virtual['partition'] + '~' + current_virtual['subPath'] + '~' + current_virtual['name'] + '/profiles')
-            else:
-                api_response = icontrol_get(host, username, password, '/ltm/virtual/~' + current_virtual['partition'] + '~' + current_virtual['name'] + '/profiles')
-            api_response_dict = json.loads(api_response)
-            current_virtual_profiles = api_response_dict['items']
-            for current_virtual_profile in current_virtual_profiles:
-                if current_virtual_profile['context'] == 'clientside' and current_virtual_profile['name'] in CLIENT_CIPHER_DICT:
-                    current_client_profile = current_virtual_profile['name']
-                    current_client_parent_profile = CLIENT_CIPHER_DICT[current_virtual_profile['name']]['parent']
-                elif current_virtual_profile['context'] == 'serverside' and current_virtual_profile['name'] in SERVER_CIPHER_DICT:
-                    current_server_profile = current_virtual_profile['name']
-                    current_server_parent_profile = SERVER_CIPHER_DICT[current_virtual_profile['name']]['parent']
+            for current_virtual_profile in current_virtual['profiles']:
+                name = current_virtual_profile['name']
+                if current_virtual_profile['context'] == 'clientside' and name in CLIENT_CIPHER_DICT:
+                    current_client_profile = name
+                    current_client_parent_profile = CLIENT_CIPHER_DICT[name]['parent']
+                elif current_virtual_profile['context'] == 'serverside' and name in SERVER_CIPHER_DICT:
+                    current_server_profile = name
+                    current_server_parent_profile = SERVER_CIPHER_DICT[name]['parent']
             report_writer.writerow([current_virtual['fullPath'],current_virtual['destination'],current_client_profile,current_client_parent_profile,current_server_profile,current_server_parent_profile])
 
-if __name__ == "__main__":
+def main():
     BIG_IP = get_args()
-    client_ssl_profile_list = retrieve_clientssl_profiles(BIG_IP['host'], BIG_IP['username'], BIG_IP['password'], BIG_IP['fullciphers'], BIG_IP['verbose'])
-    server_ssl_profile_list = retrieve_serverssl_profiles(BIG_IP['host'], BIG_IP['username'], BIG_IP['password'], BIG_IP['fullciphers'], BIG_IP['verbose'])
-    virtual_server_list = retrieve_virtual_servers(BIG_IP['host'], BIG_IP['username'], BIG_IP['password'], BIG_IP['verbose'])
-    create_ssl_report(BIG_IP['host'], BIG_IP['username'], BIG_IP['password'], BIG_IP['fullciphers'], client_ssl_profile_list,server_ssl_profile_list,virtual_server_list, BIG_IP['verbose'])
+    if BIG_IP['verify'] is False:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    bigip = BigIp(BIG_IP['host'], BIG_IP['username'], BIG_IP['password'], BIG_IP['verify'], BIG_IP['timeout'])
+    client_ssl_profile_list = retrieve_ssl_profiles(bigip, 'client-ssl', 'Client', '--clientciphers', BIG_IP['fullciphers'], BIG_IP['verbose'])
+    server_ssl_profile_list = retrieve_ssl_profiles(bigip, 'server-ssl', 'Server', '--serverciphers', BIG_IP['fullciphers'], BIG_IP['verbose'])
+    virtual_server_list = retrieve_virtual_servers(bigip, BIG_IP['verbose'])
+    create_ssl_report(BIG_IP['fullciphers'], client_ssl_profile_list, server_ssl_profile_list, virtual_server_list, BIG_IP['verbose'])
     if BIG_IP['csv']:
-        create_ssl_csv(BIG_IP['host'], BIG_IP['username'], BIG_IP['password'], BIG_IP['csv'], client_ssl_profile_list, server_ssl_profile_list, virtual_server_list)
+        create_ssl_csv(BIG_IP['csv'], client_ssl_profile_list, server_ssl_profile_list, virtual_server_list)
     print('\nReport complete.')
+
+if __name__ == "__main__":
+    main()
