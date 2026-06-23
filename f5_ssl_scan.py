@@ -27,7 +27,7 @@ import urllib3
 if sys.version_info < (3, 10):  # noqa: UP036
     sys.exit("f5_ssl_scan.py requires Python 3.10 or newer")
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 LOG = logging.getLogger('f5_ssl_scan')
 

@@ -26,7 +26,7 @@ run() { # run "<desc>" <want_exit> "<grep|->" -- cmd...
 }
 
 echo "## args / credentials (no network) ##"
-run "--version"             0 "1\.2\.0"              -- python3 "$S" --version
+run "--version"             0 "1\.3\.0"              -- python3 "$S" --version
 run "--help lists flags"    0 "--fullciphers"        -- python3 "$S" --help
 run "--help lists min-tls"  0 "--min-tls"            -- python3 "$S" --help
 run "--help lists debug"    0 "--debug"              -- python3 "$S" --help
