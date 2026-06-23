@@ -4,9 +4,15 @@ Python script that enumerates BIG-IP LTM virtual servers and their associated
 Client/Server SSL profiles, reporting each profile's cipher string (and,
 optionally, the fully expanded cipher list) via the iControl REST API.
 
+> **Run this remotely, not on the BIG-IP.** The script is a client of the
+> iControl REST API — run it from your workstation or a jump host that has
+> network access to the BIG-IP management interface. It is **not** a TMOS
+> on-box script and is not intended to be executed from the BIG-IP shell.
+
 ## Requirements
 
-- Python 3 with the `requests` library (`pip install -r requirements.txt`)
+- Python 3 with the `requests` library (`pip install -r requirements.txt`),
+  on a host **separate from the BIG-IP**
 - Network access to the BIG-IP management interface (REST)
 - A BIG-IP account with REST access. The `--fullciphers` option additionally
   runs `tmm --clientciphers` / `tmm --serverciphers` through the
