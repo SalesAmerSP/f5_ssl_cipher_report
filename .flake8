@@ -1,0 +1,4 @@
+[flake8]
+max-line-length = 120
+# E501 (line length) relaxed to match pyproject.toml ruff config.
+extend-ignore = E501
