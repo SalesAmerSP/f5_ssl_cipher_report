@@ -11,7 +11,7 @@ optionally, the fully expanded cipher list) via the iControl REST API.
 
 ## Requirements
 
-- Python 3 with the `requests` library (`pip install -r requirements.txt`),
+- Python 3.10+ with the `requests` library (`pip install -r requirements.txt`),
   on a host **separate from the BIG-IP**
 - Network access to the BIG-IP management interface (REST)
 - A BIG-IP account with REST access. The `--fullciphers` option additionally
