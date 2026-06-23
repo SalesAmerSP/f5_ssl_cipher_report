@@ -8,6 +8,7 @@ import csv
 import datetime
 import getpass
 import json
+import logging
 import os
 import re
 import shlex
@@ -27,6 +28,8 @@ if sys.version_info < (3, 10):  # noqa: UP036
     sys.exit("f5_ssl_scan.py requires Python 3.10 or newer")
 
 __version__ = "1.2.0"
+
+LOG = logging.getLogger('f5_ssl_scan')
 
 # Security-support end-of-life dates for CPython releases (source: python.org).
 # Python exposes no stdlib API for this, so it is maintained here.
@@ -55,6 +58,7 @@ class Config:
     verify: bool | str
     timeout: float
     min_tls: str | None
+    debug: bool
 
 
 def get_args() -> Config:
@@ -74,6 +78,10 @@ def get_args() -> Config:
                          help='flag for displaying list of all ciphers in profile')
     cmdargs.add_argument('--verbose', action='store_true', required=False,
                          help='prints additional information during execution')
+    cmdargs.add_argument('--debug', action='store_true', required=False,
+                         help='emit detailed diagnostic logging to stderr (each REST request, '
+                              'status, and timing, plus urllib3 connection logs). Credentials '
+                              'are never logged.')
     cmdargs.add_argument('--ca-bundle', action='store', required=False, type=str,
                          help='path to a CA bundle used to verify the BIG-IP management certificate')
     cmdargs.add_argument('--insecure', action='store_true', required=False,
@@ -116,7 +124,24 @@ def get_args() -> Config:
     return Config(host=host, username=username, password=password,
                   fullciphers=parsed_args.fullciphers, verbose=parsed_args.verbose,
                   csv=parsed_args.csv, verify=verify, timeout=parsed_args.timeout,
-                  min_tls=parsed_args.min_tls)
+                  min_tls=parsed_args.min_tls, debug=parsed_args.debug)
+
+
+def configure_logging(debug: bool) -> None:
+    """Enable detailed stderr logging when --debug is set.
+
+    urllib3's logger is surfaced because it records each request line and status
+    *without* the Authorization header. http.client debug is deliberately NOT
+    enabled: it would print the basic-auth credentials to the log.
+    """
+    if not debug:
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+    root = logging.getLogger()
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG)
+    logging.getLogger('urllib3').setLevel(logging.DEBUG)
 
 
 def abort_script(reason: object) -> NoReturn:
@@ -189,13 +214,18 @@ class BigIp:
         self.session.auth = (username, password)
         if min_tls is not None:
             self.session.mount('https://', _TLSAdapter(build_tls_context(min_tls, verify)))
+        LOG.debug('BigIp client for %s (verify=%s, timeout=%ss, min_tls=%s)',
+                  host, verify, timeout, min_tls or 'default')
 
     def _request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
         """Issue a request relative to the BIG-IP /mgmt/tm base; abort on any error."""
+        LOG.debug('%s %s', method, self.base_uri + path)
         try:
             response = self.session.request(method, self.base_uri + path, verify=self.verify,
                                             timeout=self.timeout, **kwargs)
             response.raise_for_status()
+            LOG.debug('-> HTTP %s (%d bytes, %.0f ms)', response.status_code,
+                      len(response.content), response.elapsed.total_seconds() * 1000)
         except requests.exceptions.SSLError as e:
             abort_script(str(e) + '\nThe TLS handshake to the management interface failed. '
                          'This usually means either (1) this address is a data-plane virtual '
@@ -236,10 +266,12 @@ def retrieve_ssl_profiles(bigip: BigIp, profile_type: str, label: str, tmm_flag:
         if fullciphers:
             if verbose:
                 print(' -> Retrieving complete cipher list')
+            LOG.debug('expanding ciphers for %s SSL profile %s via tmm %s', label, name, tmm_flag)
             api_payload = {"command": "run",
                            "utilCmdArgs": "-c " + shlex.quote("tmm " + tmm_flag + " " + cipherstring)}
             entry['cipherlist'] = bigip.post_json('/util/bash', api_payload)['commandResult']
         profiles[name] = entry
+    LOG.debug('retrieved %d %s SSL profile(s)', len(profiles), label)
     return profiles
 
 
@@ -262,6 +294,7 @@ def retrieve_virtual_servers(bigip: BigIp, verbose: bool) -> list[dict[str, Any]
         # Fetch each virtual's profiles once here so the console and CSV reports
         # can both read them without a second round of REST calls.
         current_virtual_server['profiles'] = fetch_virtual_profiles(bigip, current_virtual_server)
+    LOG.debug('retrieved %d virtual server(s)', len(virtual_servers))
     return virtual_servers
 
 
@@ -387,6 +420,8 @@ def main() -> None:
     """Entry point: gather profiles and virtuals, then print the report and optional CSV."""
     warn_if_python_eol()
     cfg = get_args()
+    configure_logging(cfg.debug)
+    LOG.debug('f5_ssl_scan %s starting against %s as %s', __version__, cfg.host, cfg.username)
     bigip = BigIp(cfg.host, cfg.username, cfg.password, cfg.verify, cfg.timeout, cfg.min_tls)
     client_ssl_profiles = retrieve_ssl_profiles(
         bigip, 'client-ssl', 'Client', '--clientciphers', cfg.fullciphers, cfg.verbose)
@@ -400,6 +435,7 @@ def main() -> None:
         if cfg.fullciphers:
             cipher_csv = create_cipher_csv(cfg.csv, client_ssl_profiles, server_ssl_profiles)
             print('Wrote per-profile cipher list to ' + cipher_csv)
+    LOG.debug('done')
     print('\nReport complete.')
 
 

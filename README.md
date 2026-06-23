@@ -49,6 +49,7 @@ python3 f5_ssl_scan.py --fullciphers
 | `--min-tls` | no | Minimum TLS version (`1.0`/`1.1`/`1.2`/`1.3`) for connecting to the management interface; lower it for legacy TMOS such as 13.x (see Troubleshooting). Values below 1.2 are insecure. |
 | `--timeout` | no | Per-request timeout in seconds (default: 30) |
 | `--verbose` | no | Print additional detail during execution (each profile/virtual found, non-SSL profiles) |
+| `--debug` | no | Emit detailed diagnostic logging to **stderr** (each REST request, HTTP status, byte count, and timing, plus `urllib3` connection logs). Credentials are never logged. Combine with `2>debug.log` to capture. |
 
 The password is supplied only via the `F5_PASSWORD` environment variable or the
 secure prompt — there is no `--password` flag.

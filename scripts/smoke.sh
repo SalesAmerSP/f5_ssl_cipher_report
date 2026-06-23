@@ -29,6 +29,7 @@ echo "## args / credentials (no network) ##"
 run "--version"             0 "1\.2\.0"              -- python3 "$S" --version
 run "--help lists flags"    0 "--fullciphers"        -- python3 "$S" --help
 run "--help lists min-tls"  0 "--min-tls"            -- python3 "$S" --help
+run "--help lists debug"    0 "--debug"              -- python3 "$S" --help
 run "bad min-tls rejected"  2 "invalid choice"       -- python3 "$S" --insecure --min-tls 1.5
 run "--password rejected"   2 "not supported"        -- python3 "$S" --password x
 run "missing host"          2 "host is required"     -- env -u F5_HOST python3 "$S" --insecure
@@ -55,6 +56,15 @@ run "csv + fullciphers"     0 "per-profile cipher list" -- python3 "$S" --insecu
 if [ -s /tmp/suite_ciphers.csv ] && head -1 /tmp/suite_ciphers.csv | grep -q "SSL PROFILE"; then
   echo "PASS cipher csv written"; pass=$((pass + 1))
 else echo "FAIL cipher csv"; fail=$((fail + 1)); fi
+
+# --debug: detailed logging lands on stderr, and credentials never appear there.
+python3 "$S" --insecure --debug >/tmp/suite.dbgout 2>/tmp/suite.dbgerr
+if grep -q "f5_ssl_scan:" /tmp/suite.dbgerr && grep -q "GET https" /tmp/suite.dbgerr; then
+  echo "PASS debug logging on stderr"; pass=$((pass + 1))
+else echo "FAIL debug logging"; fail=$((fail + 1)); fi
+if grep -qF "$F5_PASSWORD" /tmp/suite.dbgerr /tmp/suite.dbgout; then
+  echo "FAIL debug leaked credentials"; fail=$((fail + 1))
+else echo "PASS debug did not leak credentials"; pass=$((pass + 1)); fi
 
 echo
 echo "## RESULT: $pass passed, $fail failed ##"
