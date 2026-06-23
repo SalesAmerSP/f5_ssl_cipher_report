@@ -92,8 +92,7 @@ supplied and only for SSL profiles bound to a virtual server.
 
 ## CSV output
 
-When `--csv` is supplied, a summary row is written for every virtual server
-(independent of `--fullciphers`, which only affects console output):
+When `--csv` is supplied, a summary row is written for every virtual server:
 
 ```
 Virtual Server Path,Virtual Server Destination,CLIENT SSL PROFILE,PARENT CLIENT SSL PROFILE,SERVER SSL PROFILE,PARENT SERVER SSL PROFILE
@@ -101,6 +100,28 @@ Virtual Server Path,Virtual Server Destination,CLIENT SSL PROFILE,PARENT CLIENT 
 /Common/accounts_receivable_vs,/Common/10.1.10.70:80,none,none,none,none
 /Common/web_app_42,/Common/10.1.10.66:443,clientssl,none,none,none
 ```
+
+### Per-profile cipher CSV (`--csv` + `--fullciphers`)
+
+When `--fullciphers` is supplied alongside `--csv`, a companion
+`<csv>_ciphers.csv` (e.g. `report.csv` -> `report_ciphers.csv`) is also written.
+It has one row per **SSL profile** (not per virtual server, so a profile shared
+by many virtuals is listed once), with its expanded cipher list as
+`SUITE (PROT)` lines:
+
+```
+SSL PROFILE,CONTEXT,PARENT PROFILE,CIPHER STRING,CIPHER LIST
+clientssl,Client,none,DEFAULT,"ECDHE-RSA-AES128-GCM-SHA256 (TLS1.2)
+TLS13-AES128-GCM-SHA256 (TLS1.3)
+..."
+```
+
+The `tmm` index/ID/BITS/MAC/KEYX columns are intentionally dropped: they are
+noise for this purpose and their column positions shift between TMOS releases,
+which would make a diff lie. `PROT` is kept because protocol coverage is exactly
+what tends to change on an upgrade. This file is designed for diffing the same
+profile across two TMOS versions to see which ciphers/protocols changed. If the
+`tmm` output ever fails to parse, the raw text is preserved so nothing is lost.
 
 ## Testing
 

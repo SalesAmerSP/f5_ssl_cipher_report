@@ -47,6 +47,12 @@ if [ -s /tmp/suite.csv ] && head -1 /tmp/suite.csv | grep -q "Virtual Server Pat
   echo "PASS csv header written"; pass=$((pass + 1))
 else echo "FAIL csv header"; fail=$((fail + 1)); fi
 
+rm -f /tmp/suite_ciphers.csv
+run "csv + fullciphers"     0 "per-profile cipher list" -- python3 "$S" --insecure --csv /tmp/suite.csv --fullciphers
+if [ -s /tmp/suite_ciphers.csv ] && head -1 /tmp/suite_ciphers.csv | grep -q "SSL PROFILE"; then
+  echo "PASS cipher csv written"; pass=$((pass + 1))
+else echo "FAIL cipher csv"; fail=$((fail + 1)); fi
+
 echo
 echo "## RESULT: $pass passed, $fail failed ##"
 [ "$fail" = 0 ]
