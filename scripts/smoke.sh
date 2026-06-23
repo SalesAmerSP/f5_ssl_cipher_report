@@ -20,7 +20,7 @@ run() { # run "<desc>" <want_exit> "<grep|->" -- cmd...
   local out rc ok=1
   out=$("$@" 2>&1); rc=$?
   [ "$rc" = "$e" ] || ok=0
-  [ "$p" = "-" ] || echo "$out" | grep -qiE "$p" || ok=0
+  [ "$p" = "-" ] || echo "$out" | grep -qiE -e "$p" || ok=0
   if [ $ok = 1 ]; then echo "PASS [$rc] $d"; pass=$((pass + 1))
   else echo "FAIL [exit $rc want $e] $d"; echo "$out" | sed 's/^/     | /' | head -4; fail=$((fail + 1)); fi
 }
