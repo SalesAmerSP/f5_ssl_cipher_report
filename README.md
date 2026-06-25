@@ -44,6 +44,7 @@ python3 f5_ssl_scan.py --fullciphers
 | `--username` | yes\* | Username for REST authentication (\*or set `F5_USERNAME`) |
 | `--csv` | no | Write a per-virtual summary report to this CSV file |
 | `--fullciphers` | no | Expand and print the complete negotiated cipher list for each SSL profile (requires bash privileges; see above) |
+| `--utilization` | no | With `--csv`, also write `<csv>_utilization.csv`: per-profile handshake counts by protocol/cipher attribute (from SSL profile stats), flagging legacy protocols/ciphers still in use |
 | `--ca-bundle` | no | Path to a CA bundle used to verify the BIG-IP management certificate |
 | `--insecure` | no | Disable TLS certificate verification of the management interface (not recommended) |
 | `--min-tls` | no | Minimum TLS version (`1.0`/`1.1`/`1.2`/`1.3`) for connecting to the management interface; lower it for legacy TMOS such as 13.x (see Troubleshooting). Values below 1.2 are insecure. |
@@ -142,17 +143,48 @@ by many virtuals is listed once), with its expanded cipher list as
 
 ```
 SSL PROFILE,CONTEXT,PARENT PROFILE,CIPHER STRING,CIPHER LIST
-clientssl,Client,none,DEFAULT,"ECDHE-RSA-AES128-GCM-SHA256 (TLS1.2)
-TLS13-AES128-GCM-SHA256 (TLS1.3)
-..."
+clientssl,Client,none,DEFAULT,ECDHE-RSA-AES128-GCM-SHA256 (TLS1.2); TLS13-AES128-GCM-SHA256 (TLS1.3); ...
+clientssl-quic,Client,/Common/clientssl,cipher group /Common/f5-quic,TLS13-AES128-GCM-SHA256 (TLS1.3); TLS13-AES256-GCM-SHA384 (TLS1.3)
 ```
 
-The `tmm` index/ID/BITS/MAC/KEYX columns are intentionally dropped: they are
-noise for this purpose and their column positions shift between TMOS releases,
-which would make a diff lie. `PROT` is kept because protocol coverage is exactly
-what tends to change on an upgrade. This file is designed for diffing the same
-profile across two TMOS versions to see which ciphers/protocols changed. If the
-`tmm` output ever fails to parse, the raw text is preserved so nothing is lost.
+Each profile's full list stays on one line (entries joined with `; `) so a
+profile never spreads across multiple spreadsheet rows. The `tmm`
+index/ID/BITS/MAC/KEYX columns are intentionally dropped: they are noise for
+this purpose and their column positions shift between TMOS releases, which would
+make a diff lie. `PROT` is kept because protocol coverage is exactly what tends
+to change on an upgrade. This file is designed for diffing the same profile
+across two TMOS versions to see which ciphers/protocols changed. If the `tmm`
+output ever fails to parse, the raw text is preserved so nothing is lost.
+
+A profile that uses a **cipher group** rather than a cipher string reports its
+`CIPHER STRING` as `cipher group <path>` (TMOS stores `ciphers` as `none` in
+that case), and the cipher list is expanded from the group's rules.
+
+### Cipher utilization CSV (`--csv` + `--utilization`)
+
+The cipher CSV above tells you which ciphers a profile *offers*; `--utilization`
+tells you which are *actually being used*, so before removing a protocol or
+cipher ahead of a TMOS upgrade you can confirm whether real clients still
+negotiate it. With `--csv`, a companion `<csv>_utilization.csv` (e.g.
+`report.csv` -> `report_utilization.csv`) is written with one row per SSL
+profile and handshake counts read from the profile's `/stats`:
+
+```
+SSL PROFILE,CONTEXT,TOTAL HANDSHAKES,SSLv3,TLS1.0,TLS1.1,TLS1.2,TLS1.3,RC4,DES/3DES,MD5,SHA1-MAC,CBC-AES/CAM,NULL,ADH-anon,RSA-keyx-noPFS,RSA-1024,DEPRECATED-IN-USE
+clientssl,Client,35319,0,0,0,35319,0,0,0,0,39,39,0,0,0,0,no
+```
+
+TMOS counts handshakes by cryptographic **attribute** (protocol, bulk cipher,
+key exchange, MAC, key size), not by exact suite name, so these columns answer
+"is this legacy protocol/cipher still being negotiated?" rather than "which exact
+suite". `DEPRECATED-IN-USE=YES` flags any profile still negotiating a legacy
+protocol (SSLv3/TLS1.0/TLS1.1) or broken cipher (RC4, DES/3DES, MD5, NULL,
+anon-DH, RSA-1024); `CBC-AES/CAM` and `SHA1-MAC` are shown but not auto-flagged
+since they are not yet removed by default. Counts are **cumulative since the last
+stat reset / reboot**, not a time window — for a representative sample, reset the
+profile stats (`tmsh reset-stats ltm profile client-ssl`) and re-run after a
+period of live traffic. Exact per-suite counts are not available from stats; that
+would require an iRule logging `[SSL::cipher name]` or AVR.
 
 ## Testing
 

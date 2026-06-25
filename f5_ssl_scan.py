@@ -53,6 +53,7 @@ class Config:
     username: str
     password: str
     fullciphers: bool
+    utilization: bool
     verbose: bool
     csv: str | None
     verify: bool | str
@@ -76,6 +77,11 @@ def get_args() -> Config:
                          help='CSV filename for report (optional)')
     cmdargs.add_argument('--fullciphers', action='store_true', required=False,
                          help='flag for displaying list of all ciphers in profile')
+    cmdargs.add_argument('--utilization', action='store_true', required=False,
+                         help='with --csv, write a companion *_utilization.csv of per-profile '
+                              'handshake counts by protocol and cipher attribute (from SSL '
+                              'profile stats) so you can see which legacy protocols/ciphers are '
+                              'actually in use before removing them')
     cmdargs.add_argument('--verbose', action='store_true', required=False,
                          help='prints additional information during execution')
     cmdargs.add_argument('--debug', action='store_true', required=False,
@@ -121,8 +127,11 @@ def get_args() -> Config:
         print('WARNING: --min-tls ' + parsed_args.min_tls + ' permits legacy TLS '
               + parsed_args.min_tls + '; use only to reach old management interfaces.',
               file=sys.stderr)
+    if parsed_args.utilization and not parsed_args.csv:
+        cmdargs.error('--utilization writes a companion CSV and requires --csv <file>')
     return Config(host=host, username=username, password=password,
-                  fullciphers=parsed_args.fullciphers, verbose=parsed_args.verbose,
+                  fullciphers=parsed_args.fullciphers, utilization=parsed_args.utilization,
+                  verbose=parsed_args.verbose,
                   csv=parsed_args.csv, verify=verify, timeout=parsed_args.timeout,
                   min_tls=parsed_args.min_tls, debug=parsed_args.debug)
 
@@ -477,6 +486,95 @@ def create_cipher_csv(csvfile: str, CLIENT_CIPHER_DICT: dict[str, dict[str, str]
     return path
 
 
+# Per-profile SSL handshake utilization, read from the profile /stats endpoint.
+# TMOS counts handshakes by cryptographic *attribute* (protocol, bulk cipher, key
+# exchange, MAC), not by exact suite name, so these columns answer "is this legacy
+# protocol/cipher still being negotiated?" rather than "which exact suite".
+# Each (column, [stat leaves]) sums the software counter and its *Offload twin.
+_PROTOCOL_COLUMNS = [
+    ('SSLv3', ['sslv3']), ('TLS1.0', ['tlsv1']), ('TLS1.1', ['tlsv1_1']),
+    ('TLS1.2', ['tlsv1_2']), ('TLS1.3', ['tlsv1_3']),
+]
+_CIPHER_COLUMNS = [
+    ('RC4', ['rc4Bulk', 'rc4BulkOffload']),
+    ('DES/3DES', ['desBulk', 'desBulkOffload']),
+    ('MD5', ['md5Digest', 'md5DigestOffload']),
+    ('SHA1-MAC', ['shaDigest', 'shaDigestOffload']),
+    ('CBC-AES/CAM', ['aesBulk', 'aesBulkOffload', 'camelliaBulk', 'camelliaBulkOffload']),
+    ('NULL', ['nullBulk', 'nullDigest']),
+    ('ADH-anon', ['adhKeyxchg']),
+    ('RSA-keyx-noPFS', ['rsaKeyxchg']),
+    ('RSA-1024', ['rsaKeySize_1024', 'rsaKeySize_1024Offload']),
+]
+# Columns whose nonzero use means "a protocol/cipher that gets removed across TMOS
+# hardening is still live" -> the DEPRECATED-IN-USE flag. CBC-AES/SHA1 are shown but
+# not auto-flagged: still widely negotiated and not yet removed by default.
+_DEPRECATED_FLAG_COLUMNS = ['SSLv3', 'TLS1.0', 'TLS1.1', 'RC4', 'DES/3DES', 'MD5',
+                            'NULL', 'ADH-anon', 'RSA-1024']
+
+
+def retrieve_ssl_utilization(bigip: BigIp, profile_type: str,
+                             verbose: bool) -> dict[str, dict[str, int]]:
+    """Return {name: {stat-leaf: count}} of handshake utilization for an SSL profile type.
+
+    Reads each profile's /stats and flattens the cipherUses/protocolUses counters
+    (plus secureHandshakes) by their leaf name. Counts are cumulative since the
+    last stat reset / reboot, not a time window.
+    """
+    util: dict[str, dict[str, int]] = {}
+    for profile in bigip.get_json('/ltm/profile/' + profile_type).get('items', []):
+        name = str(profile['name'])
+        full = str(profile.get('fullPath', '/Common/' + name))
+        stats = bigip.get_json('/ltm/profile/' + profile_type + '/~'
+                               + full.strip('/').replace('/', '~') + '/stats')
+        flat: dict[str, int] = {}
+        for container in stats.get('entries', {}).values():
+            for key, val in container.get('nestedStats', {}).get('entries', {}).items():
+                if 'value' in val:
+                    flat[key.split('.')[-1]] = int(val['value'])
+        if verbose:
+            print('Stats for SSL profile ' + name + ': '
+                  + str(flat.get('secureHandshakes', 0)) + ' secure handshakes')
+        util[name] = flat
+    LOG.debug('retrieved utilization for %d %s SSL profile(s)', len(util), profile_type)
+    return util
+
+
+def utilization_csv_path(csvfile: str) -> str:
+    """Derive the companion utilization CSV path (report.csv -> report_utilization.csv)."""
+    root, ext = os.path.splitext(csvfile)
+    return root + '_utilization' + (ext or '.csv')
+
+
+def create_utilization_csv(csvfile: str, client_util: dict[str, dict[str, int]],
+                           server_util: dict[str, dict[str, int]]) -> str:
+    """Write one row per SSL profile with handshake counts by protocol/cipher attribute.
+
+    The DEPRECATED-IN-USE column flags profiles still negotiating a legacy protocol
+    or broken cipher (see _DEPRECATED_FLAG_COLUMNS) so removal candidates that are
+    actually in use stand out. Returns the path written.
+    """
+    columns = _PROTOCOL_COLUMNS + _CIPHER_COLUMNS
+    path = utilization_csv_path(csvfile)
+    try:
+        outputcsv = open(path, mode="w", newline='')
+    except OSError as e:
+        abort_script(str(e))
+    with outputcsv:
+        writer = csv.writer(outputcsv, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
+        writer.writerow(['SSL PROFILE', 'CONTEXT', 'TOTAL HANDSHAKES']
+                        + [label for label, _ in columns] + ['DEPRECATED-IN-USE'])
+        for context, util in (('Client', client_util), ('Server', server_util)):
+            for name, flat in util.items():
+                counts = {label: sum(flat.get(leaf, 0) for leaf in leaves)
+                          for label, leaves in columns}
+                flagged = any(counts[c] for c in _DEPRECATED_FLAG_COLUMNS)
+                writer.writerow([name, context, flat.get('secureHandshakes', 0)]
+                                + [counts[label] for label, _ in columns]
+                                + ['YES' if flagged else 'no'])
+    return path
+
+
 def warn_if_python_eol() -> None:
     """Warn on stderr if the running interpreter's security support has ended."""
     if PYTHON_EOL_DATE is not None and datetime.date.today() > datetime.date.fromisoformat(PYTHON_EOL_DATE):
@@ -504,6 +602,13 @@ def main() -> None:
         if cfg.fullciphers:
             cipher_csv = create_cipher_csv(cfg.csv, client_ssl_profiles, server_ssl_profiles)
             print('Wrote per-profile cipher list to ' + cipher_csv)
+        if cfg.utilization:
+            client_util = retrieve_ssl_utilization(bigip, 'client-ssl', cfg.verbose)
+            server_util = retrieve_ssl_utilization(bigip, 'server-ssl', cfg.verbose)
+            util_csv = create_utilization_csv(cfg.csv, client_util, server_util)
+            print('Wrote per-profile cipher utilization to ' + util_csv)
+            print('  (counts are cumulative since the last stat reset/reboot; '
+                  'DEPRECATED-IN-USE=YES means a legacy protocol/cipher is still being negotiated)')
     LOG.debug('done')
     print('\nReport complete.')
 
