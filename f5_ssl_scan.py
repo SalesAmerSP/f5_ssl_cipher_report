@@ -246,6 +246,53 @@ class BigIp:
         return json.loads(self._request('POST', path, data=json.dumps(payload)).text)
 
 
+# A cipher group's `ordering` maps to a tmm cipher-string keyword modifier.
+# 'default' (and any value we don't recognise) leaves tmm's own ordering in place.
+_ORDERING_MODIFIER = {'speed': '@SPEED', 'strength': '@STRENGTH'}
+
+
+def _ref_to_rest_path(ref: dict[str, Any]) -> str:
+    """Return the '~Partition~name' REST suffix for a cipher rule/group reference.
+
+    Cipher group sub-collections carry only name+partition (no fullPath), so build
+    the path from those when fullPath is absent.
+    """
+    full = ref.get('fullPath') or ('/' + str(ref.get('partition', 'Common')) + '/' + str(ref['name']))
+    return '~' + full.strip('/').replace('/', '~')
+
+
+def cipher_group_to_string(bigip: BigIp, group_path: str, verbose: bool) -> str:
+    """Flatten a cipher group to the equivalent tmm cipher string.
+
+    tmm does not accept a cipher group name, so a profile that uses a group (its
+    `ciphers` field reads 'none') has to be expanded via the group's cipher rules:
+    allow rules joined with ':', each exclude rule's tokens appended as ':!<tok>',
+    and the group ordering mapped to tmm's '@SPEED'/'@STRENGTH' modifier. The rare
+    require/restrict lists are not modelled; the built-in groups don't use them.
+    """
+    group = bigip.get_json('/ltm/cipher/group/' + _ref_to_rest_path({'fullPath': group_path}))
+    cache: dict[str, str] = {}
+
+    def rule_cipher(ref: dict[str, Any]) -> str:
+        path = _ref_to_rest_path(ref)
+        if path not in cache:
+            cache[path] = str(bigip.get_json('/ltm/cipher/rule/' + path).get('cipher', '')).strip()
+        return cache[path]
+
+    allow = [c for c in (rule_cipher(r) for r in group.get('allow', [])) if c]
+    effective = ':'.join(allow)
+    for rule in group.get('exclude', []):
+        for token in rule_cipher(rule).split(':'):
+            token = token.strip().lstrip('!')
+            if token:
+                effective += ':!' + token
+    effective += _ORDERING_MODIFIER.get(str(group.get('ordering', 'default')), '')
+    if verbose:
+        print(' -> Cipher group ' + group_path + ' resolves to: ' + effective)
+    LOG.debug('cipher group %s -> effective string %r', group_path, effective)
+    return effective
+
+
 def retrieve_ssl_profiles(bigip: BigIp, profile_type: str, label: str, tmm_flag: str,
                           fullciphers: bool, verbose: bool) -> dict[str, dict[str, str]]:
     """Return {name: {name, cipherstring, parent, [cipherlist]}} for an SSL profile type.
@@ -253,12 +300,26 @@ def retrieve_ssl_profiles(bigip: BigIp, profile_type: str, label: str, tmm_flag:
     profile_type is the REST collection ('client-ssl' / 'server-ssl'), label is the
     word used in output ('Client' / 'Server'), and tmm_flag is the tmm option used to
     expand the cipher list ('--clientciphers' / '--serverciphers').
+
+    A profile may carry either a cipher *string* (`ciphers`) or a cipher *group*
+    (`cipherGroup`); the two are mutually exclusive and TMOS reports `ciphers` as
+    'none' when a group is in use. For group-based profiles the reported cipher
+    string becomes 'cipher group <path>' and the full list (when requested) is
+    expanded from the group's rules rather than the literal 'none'.
     """
     profiles: dict[str, dict[str, str]] = {}
     for profile in bigip.get_json('/ltm/profile/' + profile_type).get('items', []):
         name = str(profile['name'])
-        cipherstring = str(profile['ciphers'])
+        ciphers = str(profile['ciphers'])
+        group = str(profile.get('cipherGroup', 'none'))
         parent = str(profile['defaultsFrom']) if 'defaultsFrom' in profile else 'none'
+        # tmm target is the literal cipher string, or the flattened group when one is set.
+        if group != 'none':
+            cipherstring = 'cipher group ' + group
+            tmm_target = cipher_group_to_string(bigip, group, verbose) if fullciphers else ''
+        else:
+            cipherstring = ciphers
+            tmm_target = ciphers
         if verbose:
             print('Found ' + label + ' SSL profile: ' + name)
             print(' -> Ciphers: ' + cipherstring)
@@ -268,7 +329,7 @@ def retrieve_ssl_profiles(bigip: BigIp, profile_type: str, label: str, tmm_flag:
                 print(' -> Retrieving complete cipher list')
             LOG.debug('expanding ciphers for %s SSL profile %s via tmm %s', label, name, tmm_flag)
             api_payload = {"command": "run",
-                           "utilCmdArgs": "-c " + shlex.quote("tmm " + tmm_flag + " " + cipherstring)}
+                           "utilCmdArgs": "-c " + shlex.quote("tmm " + tmm_flag + " " + tmm_target)}
             entry['cipherlist'] = bigip.post_json('/util/bash', api_payload)['commandResult']
         profiles[name] = entry
     LOG.debug('retrieved %d %s SSL profile(s)', len(profiles), label)
