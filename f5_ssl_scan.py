@@ -364,18 +364,26 @@ _CIPHER_ROW = re.compile(r'^\s*\d+:\s+\d+\s+(\S+)\s+\d+\s+(\S+)')
 
 
 def parse_cipher_suites(rawlist: str) -> str:
-    """Reduce raw `tmm --clientciphers`/`--serverciphers` output to 'SUITE (PROT)' lines.
+    """Reduce raw `tmm --clientciphers`/`--serverciphers` output to 'SUITE (PROT)' entries.
 
     The index/ID/BITS/MAC/KEYX columns are dropped because they are noise for
     cross-version comparison and their positions shift between TMOS releases.
     PROT is kept because protocol coverage is exactly what tends to change on an
     upgrade. If nothing parses (unexpected tmm format), the raw text is returned
     so data is never silently lost.
+
+    Entries are joined with '; ' (never a newline) so the whole list stays on a
+    single line within one CSV cell — embedded newlines would otherwise spread a
+    single profile's ciphers across many visual rows in spreadsheets.
     """
     suites = [m.group(1) + ' (' + m.group(2) + ')'
               for line in rawlist.splitlines()
               if (m := _CIPHER_ROW.match(line))]
-    return '\n'.join(suites) if suites else rawlist.strip()
+    if suites:
+        return '; '.join(suites)
+    # Fallback: unexpected tmm format — keep the raw text but collapse newlines
+    # (and any whitespace runs they create) so it remains a single-line cell.
+    return ' '.join(rawlist.split())
 
 
 def cipher_csv_path(csvfile: str) -> str:
