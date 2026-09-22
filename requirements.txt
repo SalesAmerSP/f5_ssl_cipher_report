@@ -4,4 +4,4 @@
 # HTTPAdapter and the stdlib `ssl` module, so it adds no new dependency.
 # Floors pick up known security fixes.
 requests>=2.34.2
-urllib3>=2.7.0
+urllib3>=2.8.0
